@@ -22,7 +22,7 @@ Brotli.Compress(InStr, OutStr, Enum::"TOO Brotli Level"::Heavy [, Enum::"TOO Bro
 Brotli.Decompress(BrInStr, OutStr);
 ```
 
-- **Levels:** Fast = double-fast parse; Medium = lazy parse with speed limits + long-distance matching; Heavy = full lazy
+- **Levels:** Fast = double-fast parse (literal step 2, 3 for ColumnData); Medium = lazy parse with speed limits + long-distance matching; Heavy = full lazy
   search + long-distance matching. Both codecs use the same parser, so each level finds the same matches in both.
 - **zstd `Decompress`:** reads any zstd stream up to level 19. It has no window above 16 MB (`--long`, level 20+), no
   trained dictionary, and it doesn't verify the checksum.
@@ -37,8 +37,8 @@ profile:
 
 | | Fast | Medium | Heavy | Binary DB (Heavy) | Files ≤ 256 KB (Heavy) |
 |---|---|---|---|---|---|
-| zstd | -4.1 % | -12.5 % | -13.5 % | -9.9 % | ~-3 % |
-| Brotli | -6.7 % | -14.9 % | -15.9 % | -15.6 % | ~-6 % |
+| zstd | -3.0 % | -12.5 % | -13.5 % | -9.9 % | ~-3 % |
+| Brotli | -6.3 % | -14.9 % | -15.9 % | -15.6 % | ~-6 % |
 
 AL time per MB of the full-size files of this corpus (53 MB), General profile, from the transpiled codeunits
 (`bench/AlTranspile`: 20 ns per AL statement, 450 ns per call). Absolute times depend on the data and on the BC
@@ -46,12 +46,12 @@ environment (on the BC profile of a Brotli roundtrip, BC ran at ~0.85x this mode
 
 | | Encode Fast | Encode Medium | Encode Heavy | Decode |
 |---|---|---|---|---|
-| zstd | ~250 ms | ~515 ms | ~625 ms | ~70-80 ms |
-| Brotli | ~275 ms | ~540 ms | ~650 ms | ~85-95 ms |
+| zstd | ~185 ms | ~435 ms | ~525 ms | ~65-70 ms |
+| Brotli | ~230 ms | ~475 ms | ~565 ms | ~80-90 ms |
 
 - **zstd:** its frames open in Windows Explorer and the zstd CLI.
 - **Brotli:** 2-5 points smaller, most of all on binary and structured data, because it codes each literal with the
-  context of the 2 previous bytes. It encodes ~5 % slower than zstd and decodes ~15 % slower. Its streams open with .NET
+  context of the 2 previous bytes. It encodes ~10 % slower than zstd (~20 % at Fast) and decodes ~25 % slower. Its streams open with .NET
   `BrotliStream`, browsers and the brotli CLI.
 - Every level is slower than GZip: these codecs trade speed for size.
 
