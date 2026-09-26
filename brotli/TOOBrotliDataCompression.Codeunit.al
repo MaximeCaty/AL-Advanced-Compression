@@ -95,6 +95,7 @@ codeunit 51160 "TOO Brotli Data Compression"
         SkipRunInsert: Boolean;
         RepCheckCount: Integer;
         DfShortMul: BigInteger;
+        DfStep: Integer; // double fast parse : literal step (+ run / 128)
         LdmPos: array[524288] of Integer;
         LdmTag: array[524288] of Integer;
         LdmNext: array[131072] of Integer;
@@ -760,12 +761,17 @@ codeunit 51160 "TOO Brotli Data Compression"
         LdmMinInput := 0;
         SkipRunInsert := false;
         DfShortMul := 4294967296L; // 5-byte short hash
+        DfStep := 1;
         case Level of
             Level::Fast:
                 begin
                     MaxStage := 6;
                     DoubleFast := true;
                     SpeedMode := true;
+                    // literal step 3 : matches found at a skipped position are recovered by the backward extension.
+                    // Measured 2026-09-26 (AL time model) : osdb 9.6 MB -24 % time and -0.3 % size vs step 1, mixed 6.5 MB tar
+                    // -19 % time, +1.7 % size
+                    DfStep := 3;
                 end;
             Level::Medium:
                 begin
@@ -841,7 +847,10 @@ codeunit 51160 "TOO Brotli Data Compression"
         end;
         case Level of
             Level::Fast:
-                DfShortMul := 0; // 4-byte short hash
+                begin
+                    DfShortMul := 0; // 4-byte short hash
+                    DfStep := 2; // step 2 : -13 % time, +1.4 % size on a mixed 6.5 MB tar vs step 1 (step 3 : -19 %, +2.9 %)
+                end;
             Level::Medium:
                 begin
                     SearchDepth := 16;
@@ -2268,7 +2277,7 @@ codeunit 51160 "TOO Brotli Data Compression"
     /// per match. Candidates in order : Rep1 at Pos + 1 (LL >= 1, costs ~1 bit), the 8-byte one (>= 8 equal),
     /// the 5-byte one (>= 5 equal) ; the first one that reaches its minimum wins. A candidate is extended only when its
     /// first byte matches : forward (4 bytes per test to 16, 64-byte bulk, 4 bytes per test), then backward into the
-    /// pending literals. No match : skip 1 + (literal run) / 128 (zstd kSearchStrength 7 ; 8 : -0.03 % size, +1.2 % time).
+    /// pending literals. No match : skip DfStep + (literal run) / 128 (zstd kSearchStrength 7 ; 8 : -0.03 % size, +1.2 % time).
     /// The sequence record (EmitSequence) is inline ; literals stay in InText. HOT-INLINE : one copy of the extension per
     /// candidate (a loop over the 3 kinds cost ~20 statements per position).
     /// </summary>
@@ -2457,7 +2466,7 @@ codeunit 51160 "TOO Brotli Data Compression"
             end;
 
             if ML = 0 then
-                Pos += 1 + (Pos - SeqAnchor) div 128
+                Pos += DfStep + (Pos - SeqAnchor) div 128
             else begin
                 // backward extension into the pending literals
                 Same := true;
