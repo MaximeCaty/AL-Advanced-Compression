@@ -446,6 +446,8 @@ codeunit 51150 "TOO ZSTD Data Compression"
 
     local procedure HighBit(Value: Integer) Result: Integer
     begin
+        if (Value >= 1) and (Value <= 1024) then
+            exit(HBTbl[Value]);
         while Value >= 2 do begin
             Value := Value div 2;
             Result += 1;
@@ -1036,7 +1038,6 @@ codeunit 51150 "TOO ZSTD Data Compression"
     var
         OfValue: BigInteger;
         Offset: BigInteger;
-        FramePos: BigInteger;
         B0: Integer;
         SeqCount: Integer;
         Modes: Integer;
@@ -1210,8 +1211,7 @@ codeunit 51150 "TOO ZSTD Data Compression"
                     LitPos += LL;
                 end;
                 TbLen := OutTB.Length();
-                FramePos := OutDropped + TbLen;
-                if (Offset < 1) or (Offset > FramePos) or (Offset > WinSize) or (Offset > TbLen) then
+                if (Offset < 1) or (Offset > OutDropped + TbLen) or (Offset > WinSize) or (Offset > TbLen) then
                     Error(CorruptErr);
                 if Offset >= ML then
                     OutTB.Append(OutTB.ToText(TbLen - Offset + 1, ML))
@@ -1474,7 +1474,7 @@ codeunit 51150 "TOO ZSTD Data Compression"
             S := DSymbol[Base + U + 1];
             NextState := SymbolNext[S + 1];
             SymbolNext[S + 1] += 1;
-            NbBits := TableLog - HighBit(NextState);
+            NbBits := TableLog - HBTbl[NextState]; // NextState 1 .. 2 x table size - 1 <= 1023
             DNbBits[Base + U + 1] := NbBits;
             DBase[Base + U + 1] := NextState * Pow2B[NbBits + 1] - Size;
         end;
@@ -1811,6 +1811,7 @@ codeunit 51150 "TOO ZSTD Data Compression"
         R: Integer;
         RepNo: Integer;
         SDepth: Integer;
+        D: Integer;
         BestLen: Integer;
         BestOff: Integer;
         BestGain: Integer;
@@ -1930,13 +1931,11 @@ codeunit 51150 "TOO ZSTD Data Compression"
                         SDepth := 0;
                 end;
             end;
-            for RepNo := 2 to RepCheckCount do begin
-                if RepNo = 2 then
-                    R := PRep2
-                else
-                    R := PRep3;
-                if (R <= Q) and (R <= WindowSize) then
-                    if InText[Q - R + 1] = InText[Q + 1] then begin
+            // PRep2 then PRep3 : R by expression (a statement per case branch costs more)
+            for RepNo := 2 to RepCheckCount do
+                if (PRep2 * (3 - RepNo) + PRep3 * (RepNo - 2) <= Q) and (PRep2 * (3 - RepNo) + PRep3 * (RepNo - 2) <= WindowSize) then
+                    if InText[Q - PRep2 * (3 - RepNo) - PRep3 * (RepNo - 2) + 1] = InText[Q + 1] then begin
+                        R := PRep2 * (3 - RepNo) + PRep3 * (RepNo - 2);
                         Cand := Q - R;
                         L := 1;
                         while (InText[Cand + L + 1] = InText[Q + L + 1]) and (L < Lim) do
@@ -1970,15 +1969,18 @@ codeunit 51150 "TOO ZSTD Data Compression"
                             end;
                         end;
                     end;
-            end;
 
             // hash chain (the head entry for Q is Q itself ; a Q past InsLast was not inserted : its slot holds an older or
             // previous-call entry, rejected by the reach test) ; speed mode good_length 8 : a lazy step after a match >= 8
             // searches depth / 4 (DepthOf[2])
             Cand := Chain[Q mod 1000000 + 1] - 1 - PosBase;
             QChar := InText[Q + FBLen + 1]; // cheap reject char, Q side : changes only with FBLen (<= BlockEnd + 1 : guard char)
-            // bounds in the loop test : Cand >= 0 (an entry of this call), Q - Cand <= Reach (window, chain reach)
-            while (Q - Cand <= Reach) and (Cand >= 0) and (SDepth > 0) do begin
+            // up to SDepth candidates : a for loop (BC counts its statement once, a while test per pass) ; bounds Cand >= 0
+            // (an entry of this call), Q - Cand <= Reach (window, chain reach) ; a match up to the block end or of NiceLen
+            // ends the search (break)
+            for D := 1 to SDepth do begin
+                if (Q - Cand > Reach) or (Cand < 0) then
+                    break;
                 if InText[Cand + FBLen + 1] = QChar then begin
                     // a candidate beats the best only if it is longer : later chain candidates are farther (same
                     // or larger log2 offset), repeat gains are 4 x L - 1. So once FBLen >= 16, its FBLen bytes are
@@ -2037,13 +2039,11 @@ codeunit 51150 "TOO ZSTD Data Compression"
                             FBGain := G;
                             QChar := InText[Q + FBLen + 1]; // <= BlockEnd + 1 : guard char
                             if (Q + L = BlockEnd) or (L >= NiceStop) then
-                                SDepth := 0;
+                                break;
                         end;
                     end;
                 end;
-                // no SDepth > 0 test : a stop (SDepth := 0) turns into -1 here and ends the loop, Cand is unused after
                 Cand := Chain[Cand mod 1000000 + 1] - 1 - PosBase;
-                SDepth -= 1;
             end;
 
             // primary / lazy decision
@@ -2220,93 +2220,91 @@ codeunit 51150 "TOO ZSTD Data Compression"
             DfLong[HL + 1] := Pos + 1 + PosBase;
             DfShort[HS + 1] := Pos + 1 + PosBase;
 
-            // Rep1 at Pos + 1 (minimum 4)
+            // Rep1 at Pos + 1 (minimum 4) ; PRep1 <= Pos + 1 (an offset never passes its match start, the initial one is 1) :
+            // no bound test
             ML := 0;
-            S := Pos + 1;
-            Cn := S - PRep1;
-            if Cn >= 0 then
-                if InText[Cn + 1] = InText[S + 1] then begin
-                    L := 1;
-                    // extension : 4 bytes per test to 16, 64-byte bulk, 256-byte bulk after a 64 hit, then 4 bytes per test. The
-                    // tests read up to 4 chars past BlockEnd (guard chars), the limit test drops them
+            if InText[Pos + 2 - PRep1] = InText[Pos + 2] then begin
+                S := Pos + 1;
+                Cn := S - PRep1;
+                L := 1;
+                // extension : 4 bytes per test to 16, 64-byte bulk, 256-byte bulk after a 64 hit, then 4 bytes per test. The
+                // tests read up to 4 chars past BlockEnd (guard chars), the limit test drops them
+                while (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and
+                    (InText[Cn + L + 3] = InText[S + L + 3]) and (InText[Cn + L + 4] = InText[S + L + 4]) and (L + 4 <= 16) and (S + L + 4 <= BlockEnd)
+                do
+                    L += 4;
+                if (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and (L + 2 <= 16) and (S + L + 2 <= BlockEnd) then
+                    L += 2;
+                if (InText[Cn + L + 1] = InText[S + L + 1]) and (L < 16) and (S + L < BlockEnd) then
+                    L += 1;
+                if L = 16 then begin
+                    if S + L + 64 <= BlockEnd then
+                        if InText.Substring(Cn + L + 1, 64) = InText.Substring(S + L + 1, 64) then begin
+                            L += 64;
+                            while S + L + 256 <= BlockEnd do
+                                if InText.Substring(Cn + L + 1, 256) = InText.Substring(S + L + 1, 256) then
+                                    L += 256
+                                else
+                                    break;
+                            while S + L + 64 <= BlockEnd do
+                                if InText.Substring(Cn + L + 1, 64) = InText.Substring(S + L + 1, 64) then
+                                    L += 64
+                                else
+                                    break;
+                        end;
                     while (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and
-                        (InText[Cn + L + 3] = InText[S + L + 3]) and (InText[Cn + L + 4] = InText[S + L + 4]) and (L + 4 <= 16) and (S + L + 4 <= BlockEnd)
+                        (InText[Cn + L + 3] = InText[S + L + 3]) and (InText[Cn + L + 4] = InText[S + L + 4]) and (S + L + 4 <= BlockEnd)
                     do
                         L += 4;
-                    if (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and (L + 2 <= 16) and (S + L + 2 <= BlockEnd) then
+                    if (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and (S + L + 2 <= BlockEnd) then
                         L += 2;
-                    if (InText[Cn + L + 1] = InText[S + L + 1]) and (L < 16) and (S + L < BlockEnd) then
+                    if (InText[Cn + L + 1] = InText[S + L + 1]) and (S + L < BlockEnd) then
                         L += 1;
-                    if L = 16 then begin
-                        if S + L + 64 <= BlockEnd then
-                            if InText.Substring(Cn + L + 1, 64) = InText.Substring(S + L + 1, 64) then begin
-                                L += 64;
-                                while S + L + 256 <= BlockEnd do
-                                    if InText.Substring(Cn + L + 1, 256) = InText.Substring(S + L + 1, 256) then
-                                        L += 256
-                                    else
-                                        break;
-                                while S + L + 64 <= BlockEnd do
-                                    if InText.Substring(Cn + L + 1, 64) = InText.Substring(S + L + 1, 64) then
-                                        L += 64
-                                    else
-                                        break;
-                            end;
-                        while (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and
-                            (InText[Cn + L + 3] = InText[S + L + 3]) and (InText[Cn + L + 4] = InText[S + L + 4]) and (S + L + 4 <= BlockEnd)
-                        do
-                            L += 4;
-                        if (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and (S + L + 2 <= BlockEnd) then
-                            L += 2;
-                        if (InText[Cn + L + 1] = InText[S + L + 1]) and (S + L < BlockEnd) then
-                            L += 1;
-                    end;
-                    if L >= 4 then begin
-                        ML := L;
-                        MStart := S;
-                        Off := PRep1;
-                    end;
                 end;
+                if L >= 4 then begin
+                    ML := L;
+                    MStart := S;
+                    Off := PRep1;
+                end;
+            end;
             // the 8-byte candidate (minimum 8), then the 5-byte one (minimum 5 : zstd level 3 minMatch, a 4-byte match barely
             // pays for its sequence)
             if ML = 0 then begin
-                S := Pos;
                 if (CandL >= 0) and (Pos - CandL <= WindowSize) then
                     if InText[CandL + 1] = InText[Pos + 1] then begin
-                        Cn := CandL;
                         L := 1;
                         // extension : 4 bytes per test to 16, 64-byte bulk, 256-byte bulk after a 64 hit, then 4 bytes per test. The
                         // tests read up to 4 chars past BlockEnd (guard chars), the limit test drops them
-                        while (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and
-                            (InText[Cn + L + 3] = InText[S + L + 3]) and (InText[Cn + L + 4] = InText[S + L + 4]) and (L + 4 <= 16) and (S + L + 4 <= BlockEnd)
+                        while (InText[CandL + L + 1] = InText[Pos + L + 1]) and (InText[CandL + L + 2] = InText[Pos + L + 2]) and
+                            (InText[CandL + L + 3] = InText[Pos + L + 3]) and (InText[CandL + L + 4] = InText[Pos + L + 4]) and (L + 4 <= 16) and (Pos + L + 4 <= BlockEnd)
                         do
                             L += 4;
-                        if (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and (L + 2 <= 16) and (S + L + 2 <= BlockEnd) then
+                        if (InText[CandL + L + 1] = InText[Pos + L + 1]) and (InText[CandL + L + 2] = InText[Pos + L + 2]) and (L + 2 <= 16) and (Pos + L + 2 <= BlockEnd) then
                             L += 2;
-                        if (InText[Cn + L + 1] = InText[S + L + 1]) and (L < 16) and (S + L < BlockEnd) then
+                        if (InText[CandL + L + 1] = InText[Pos + L + 1]) and (L < 16) and (Pos + L < BlockEnd) then
                             L += 1;
                         if L = 16 then begin
-                            if S + L + 64 <= BlockEnd then
-                                if InText.Substring(Cn + L + 1, 64) = InText.Substring(S + L + 1, 64) then begin
+                            if Pos + L + 64 <= BlockEnd then
+                                if InText.Substring(CandL + L + 1, 64) = InText.Substring(Pos + L + 1, 64) then begin
                                     L += 64;
-                                    while S + L + 256 <= BlockEnd do
-                                        if InText.Substring(Cn + L + 1, 256) = InText.Substring(S + L + 1, 256) then
+                                    while Pos + L + 256 <= BlockEnd do
+                                        if InText.Substring(CandL + L + 1, 256) = InText.Substring(Pos + L + 1, 256) then
                                             L += 256
                                         else
                                             break;
-                                    while S + L + 64 <= BlockEnd do
-                                        if InText.Substring(Cn + L + 1, 64) = InText.Substring(S + L + 1, 64) then
+                                    while Pos + L + 64 <= BlockEnd do
+                                        if InText.Substring(CandL + L + 1, 64) = InText.Substring(Pos + L + 1, 64) then
                                             L += 64
                                         else
                                             break;
                                 end;
-                            while (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and
-                                (InText[Cn + L + 3] = InText[S + L + 3]) and (InText[Cn + L + 4] = InText[S + L + 4]) and (S + L + 4 <= BlockEnd)
+                            while (InText[CandL + L + 1] = InText[Pos + L + 1]) and (InText[CandL + L + 2] = InText[Pos + L + 2]) and
+                                (InText[CandL + L + 3] = InText[Pos + L + 3]) and (InText[CandL + L + 4] = InText[Pos + L + 4]) and (Pos + L + 4 <= BlockEnd)
                             do
                                 L += 4;
-                            if (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and (S + L + 2 <= BlockEnd) then
+                            if (InText[CandL + L + 1] = InText[Pos + L + 1]) and (InText[CandL + L + 2] = InText[Pos + L + 2]) and (Pos + L + 2 <= BlockEnd) then
                                 L += 2;
-                            if (InText[Cn + L + 1] = InText[S + L + 1]) and (S + L < BlockEnd) then
+                            if (InText[CandL + L + 1] = InText[Pos + L + 1]) and (Pos + L < BlockEnd) then
                                 L += 1;
                         end;
                         if L >= 8 then begin
@@ -2318,40 +2316,39 @@ codeunit 51150 "TOO ZSTD Data Compression"
                 if ML = 0 then
                     if (CandS >= 0) and (CandS <> CandL) and (Pos - CandS <= WindowSize) then
                         if InText[CandS + 1] = InText[Pos + 1] then begin
-                            Cn := CandS;
                             L := 1;
                             // extension : 4 bytes per test to 16, 64-byte bulk, 256-byte bulk after a 64 hit, then 4 bytes per test. The
                             // tests read up to 4 chars past BlockEnd (guard chars), the limit test drops them
-                            while (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and
-                                (InText[Cn + L + 3] = InText[S + L + 3]) and (InText[Cn + L + 4] = InText[S + L + 4]) and (L + 4 <= 16) and (S + L + 4 <= BlockEnd)
+                            while (InText[CandS + L + 1] = InText[Pos + L + 1]) and (InText[CandS + L + 2] = InText[Pos + L + 2]) and
+                                (InText[CandS + L + 3] = InText[Pos + L + 3]) and (InText[CandS + L + 4] = InText[Pos + L + 4]) and (L + 4 <= 16) and (Pos + L + 4 <= BlockEnd)
                             do
                                 L += 4;
-                            if (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and (L + 2 <= 16) and (S + L + 2 <= BlockEnd) then
+                            if (InText[CandS + L + 1] = InText[Pos + L + 1]) and (InText[CandS + L + 2] = InText[Pos + L + 2]) and (L + 2 <= 16) and (Pos + L + 2 <= BlockEnd) then
                                 L += 2;
-                            if (InText[Cn + L + 1] = InText[S + L + 1]) and (L < 16) and (S + L < BlockEnd) then
+                            if (InText[CandS + L + 1] = InText[Pos + L + 1]) and (L < 16) and (Pos + L < BlockEnd) then
                                 L += 1;
                             if L = 16 then begin
-                                if S + L + 64 <= BlockEnd then
-                                    if InText.Substring(Cn + L + 1, 64) = InText.Substring(S + L + 1, 64) then begin
+                                if Pos + L + 64 <= BlockEnd then
+                                    if InText.Substring(CandS + L + 1, 64) = InText.Substring(Pos + L + 1, 64) then begin
                                         L += 64;
-                                        while S + L + 256 <= BlockEnd do
-                                            if InText.Substring(Cn + L + 1, 256) = InText.Substring(S + L + 1, 256) then
+                                        while Pos + L + 256 <= BlockEnd do
+                                            if InText.Substring(CandS + L + 1, 256) = InText.Substring(Pos + L + 1, 256) then
                                                 L += 256
                                             else
                                                 break;
-                                        while S + L + 64 <= BlockEnd do
-                                            if InText.Substring(Cn + L + 1, 64) = InText.Substring(S + L + 1, 64) then
+                                        while Pos + L + 64 <= BlockEnd do
+                                            if InText.Substring(CandS + L + 1, 64) = InText.Substring(Pos + L + 1, 64) then
                                                 L += 64
                                             else
                                                 break;
                                     end;
-                                while (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and
-                                    (InText[Cn + L + 3] = InText[S + L + 3]) and (InText[Cn + L + 4] = InText[S + L + 4]) and (S + L + 4 <= BlockEnd)
+                                while (InText[CandS + L + 1] = InText[Pos + L + 1]) and (InText[CandS + L + 2] = InText[Pos + L + 2]) and
+                                    (InText[CandS + L + 3] = InText[Pos + L + 3]) and (InText[CandS + L + 4] = InText[Pos + L + 4]) and (Pos + L + 4 <= BlockEnd)
                                 do
                                     L += 4;
-                                if (InText[Cn + L + 1] = InText[S + L + 1]) and (InText[Cn + L + 2] = InText[S + L + 2]) and (S + L + 2 <= BlockEnd) then
+                                if (InText[CandS + L + 1] = InText[Pos + L + 1]) and (InText[CandS + L + 2] = InText[Pos + L + 2]) and (Pos + L + 2 <= BlockEnd) then
                                     L += 2;
-                                if (InText[Cn + L + 1] = InText[S + L + 1]) and (S + L < BlockEnd) then
+                                if (InText[CandS + L + 1] = InText[Pos + L + 1]) and (Pos + L < BlockEnd) then
                                     L += 1;
                             end;
                             if L >= 5 then begin
@@ -2863,20 +2860,24 @@ codeunit 51150 "TOO ZSTD Data Compression"
         Clear(BlockTB);
         BwAcc := 0;
         BwCount := 0;
-        for I := LastIdx downto FirstIdx do begin
+        // HOT : 2 literals per add (codes <= 11 bits : <= 15 pending + 22), 2-byte flushes only (AddBits of the close
+        // takes up to 15 pending bits)
+        I := LastIdx;
+        while I > FirstIdx do begin
             C := LitText[I];
-            BwAcc += HufCode[C + 1] * Pow2B[BwCount + 1];
-            BwCount += HufLen[C + 1];
+            BwAcc += (HufCode[C + 1] + HufCode[LitText[I - 1] + 1] * Pow2B[HufLen[C + 1] + 1]) * Pow2B[BwCount + 1];
+            BwCount += HufLen[C + 1] + HufLen[LitText[I - 1] + 1];
             while BwCount >= 16 do begin
                 BlockTB.Append(PairTbl[BwAcc mod 65536 + 1]);
                 BwAcc := BwAcc div 65536;
                 BwCount -= 16;
             end;
-            if BwCount >= 8 then begin
-                BlockTB.Append(CharTbl[BwAcc mod 256 + 1]);
-                BwAcc := BwAcc div 256;
-                BwCount -= 8;
-            end;
+            I -= 2;
+        end;
+        if I = FirstIdx then begin
+            C := LitText[I];
+            BwAcc += HufCode[C + 1] * Pow2B[BwCount + 1];
+            BwCount += HufLen[C + 1];
         end;
         BitCloseStream();
         exit(BlockTB.ToText());
@@ -3116,6 +3117,8 @@ codeunit 51150 "TOO ZSTD Data Compression"
         Code: Integer;
         Idx: Integer;
         NB: Integer;
+        NbOF: Integer;
+        NbML: Integer;
         Slot: Integer;
         StateLL: Integer;
         StateOF: Integer;
@@ -3204,57 +3207,60 @@ codeunit 51150 "TOO ZSTD Data Compression"
         AddBits(SeqML[N] - 3, MLBits[SeqMLCode[N] + 1]);
         AddBits(SeqOfv[N], SeqOFCode[N]);
         for N := NbSeq - 1 downto 1 do begin
-            // FSE symbols OF (slot 2), ML (slot 3), LL (slot 1) : <= 26 bits + 7 pending
-            if not RleOF then begin
-                Idx := 64 + SeqOFCode[N] + 1;
-                NB := (StateOF + DeltaNbBits[Idx]) div 65536;
-                BwAcc += (StateOF mod Pow2B[NB + 1]) * Pow2B[BwCount + 1];
-                BwCount += NB;
-                StateOF := CState[512 + StateOF div Pow2B[NB + 1] + DeltaFindState[Idx] + 1];
-            end;
-            if not RleML then begin
-                Idx := 128 + SeqMLCode[N] + 1;
-                NB := (StateML + DeltaNbBits[Idx]) div 65536;
-                BwAcc += (StateML mod Pow2B[NB + 1]) * Pow2B[BwCount + 1];
-                BwCount += NB;
-                StateML := CState[1024 + StateML div Pow2B[NB + 1] + DeltaFindState[Idx] + 1];
-            end;
-            if not RleLL then begin
-                Idx := SeqLLCode[N] + 1;
-                NB := (StateLL + DeltaNbBits[Idx]) div 65536;
-                BwAcc += (StateLL mod Pow2B[NB + 1]) * Pow2B[BwCount + 1];
-                BwCount += NB;
-                StateLL := CState[StateLL div Pow2B[NB + 1] + DeltaFindState[Idx] + 1];
+            // FSE symbols OF (slot 2), ML (slot 3), LL (slot 1) : <= 26 bits + 15 pending ; in one add when no slot is RLE
+            if RleOF or RleML or RleLL then begin
+                if not RleOF then begin
+                    Idx := 64 + SeqOFCode[N] + 1;
+                    NB := (StateOF + DeltaNbBits[Idx]) div 65536;
+                    BwAcc += (StateOF mod Pow2B[NB + 1]) * Pow2B[BwCount + 1];
+                    BwCount += NB;
+                    StateOF := CState[512 + StateOF div Pow2B[NB + 1] + DeltaFindState[Idx] + 1];
+                end;
+                if not RleML then begin
+                    Idx := 128 + SeqMLCode[N] + 1;
+                    NB := (StateML + DeltaNbBits[Idx]) div 65536;
+                    BwAcc += (StateML mod Pow2B[NB + 1]) * Pow2B[BwCount + 1];
+                    BwCount += NB;
+                    StateML := CState[1024 + StateML div Pow2B[NB + 1] + DeltaFindState[Idx] + 1];
+                end;
+                if not RleLL then begin
+                    Idx := SeqLLCode[N] + 1;
+                    NB := (StateLL + DeltaNbBits[Idx]) div 65536;
+                    BwAcc += (StateLL mod Pow2B[NB + 1]) * Pow2B[BwCount + 1];
+                    BwCount += NB;
+                    StateLL := CState[StateLL div Pow2B[NB + 1] + DeltaFindState[Idx] + 1];
+                end;
+            end else begin
+                NbOF := (StateOF + DeltaNbBits[64 + SeqOFCode[N] + 1]) div 65536;
+                NbML := (StateML + DeltaNbBits[128 + SeqMLCode[N] + 1]) div 65536;
+                NB := (StateLL + DeltaNbBits[SeqLLCode[N] + 1]) div 65536;
+                BwAcc += ((StateOF mod Pow2B[NbOF + 1]) + ((StateML mod Pow2B[NbML + 1]) + (StateLL mod Pow2B[NB + 1]) * Pow2B[NbML + 1]) *
+                    Pow2B[NbOF + 1]) * Pow2B[BwCount + 1];
+                BwCount += NbOF + NbML + NB;
+                StateOF := CState[512 + StateOF div Pow2B[NbOF + 1] + DeltaFindState[64 + SeqOFCode[N] + 1] + 1];
+                StateML := CState[1024 + StateML div Pow2B[NbML + 1] + DeltaFindState[128 + SeqMLCode[N] + 1] + 1];
+                StateLL := CState[StateLL div Pow2B[NB + 1] + DeltaFindState[SeqLLCode[N] + 1] + 1];
             end;
             while BwCount >= 16 do begin
                 BlockTB.Append(PairTbl[BwAcc mod 65536 + 1]);
                 BwAcc := BwAcc div 65536;
                 BwCount -= 16;
             end;
-            if BwCount >= 8 then begin
-                BlockTB.Append(CharTbl[BwAcc mod 256 + 1]);
-                BwAcc := BwAcc div 256;
-                BwCount -= 8;
-            end;
-            // extra bits LL (<= 16), ML (<= 16), OF (<= 24 with window log 24) : <= 56 bits + 7 pending < 2^63
+            // extra bits LL (<= 16) + ML (<= 16) in one add, then OF (<= 31) : each <= 32 bits + 15 pending < 2^63
             NB := LLBits[SeqLLCode[N] + 1];
-            BwAcc += (SeqLL[N] mod Pow2B[NB + 1]) * Pow2B[BwCount + 1];
-            BwCount += NB;
-            NB := MLBits[SeqMLCode[N] + 1];
-            BwAcc += ((SeqML[N] - 3) mod Pow2B[NB + 1]) * Pow2B[BwCount + 1];
-            BwCount += NB;
-            NB := SeqOFCode[N];
-            BwAcc += (SeqOfv[N] - Pow2B[NB + 1]) * Pow2B[BwCount + 1]; // code = highbit(value) : value mod 2^code = value - 2^code
-            BwCount += NB;
+            BwAcc += ((SeqLL[N] mod Pow2B[NB + 1]) + ((SeqML[N] - 3) mod Pow2B[MLBits[SeqMLCode[N] + 1] + 1]) * Pow2B[NB + 1]) * Pow2B[BwCount + 1];
+            BwCount += NB + MLBits[SeqMLCode[N] + 1];
             while BwCount >= 16 do begin
                 BlockTB.Append(PairTbl[BwAcc mod 65536 + 1]);
                 BwAcc := BwAcc div 65536;
                 BwCount -= 16;
             end;
-            if BwCount >= 8 then begin
-                BlockTB.Append(CharTbl[BwAcc mod 256 + 1]);
-                BwAcc := BwAcc div 256;
-                BwCount -= 8;
+            BwAcc += (SeqOfv[N] - Pow2B[SeqOFCode[N] + 1]) * Pow2B[BwCount + 1]; // code = highbit(value) : value mod 2^code = value - 2^code
+            BwCount += SeqOFCode[N];
+            while BwCount >= 16 do begin
+                BlockTB.Append(PairTbl[BwAcc mod 65536 + 1]);
+                BwAcc := BwAcc div 65536;
+                BwCount -= 16;
             end;
         end;
         if not RleML then
